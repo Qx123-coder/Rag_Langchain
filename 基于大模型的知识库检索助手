@@ -1,0 +1,50 @@
+#这是一个入门级的基于Langchain框架的Rag项目-基于大模型的知识库检索助手
+#输入问题 → 组合数据 → 填充模板 → 调用模型 → 输出答案
+import os
+from langchain_chroma import Chroma
+from langchain_community.document_loaders import Docx2txtLoader
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnableLambda, RunnablePassthrough
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.embeddings import DashScopeEmbeddings
+from models import get_lc_model_client, ALI_TONGYI_EMBEDDING_MODEL,get_ali_model_client
+##调用大模型
+client = get_ali_model_client()
+##获取原文档
+loader = Docx2txtLoader("人事管理资料.docx")
+documents = loader.load()
+##文档分块-并用嵌入模型向量化-再存入向量数据库中
+###这里还可加入需要额外的分隔符
+text_splitter = RecursiveCharacterTextSplitter(
+  chunk_size = 1000,
+  chunk_overlap = 100
+)
+split_documents = text_splitter.split_documents(documents)
+llm_embeddings = DashScopeEmbeddings(
+  model = ALI_TONGYI_EMBEDDING_MODEL,
+  dashscope_api_key = os.getenv("DASHSCOPE_API_KEY")
+)
+vector_store = Chroma.from_documents(
+  documents = split_documents,
+  embedding = llm_embeddings
+)
+###由于我们需要用链生成答案，所以需要Runnable对象
+####这里限制k=1
+docs_find = RunnableLambda(vector_store.similarity_search).bind(k=1)
+message = """
+角色:你是一个专业的问答助手
+要求:
+1. 仅使用下面提供的上下文信息来回答问题
+2. 如果上下文中的信息不足以回答问题，请说"目前您所提供信息不足,请再给我多一点的信息"
+3. 回答要简洁明了，直接基于上下文内容
+问题:{question}
+上下文内容:{context}
+请基于上述上下文内容回答:
+"""
+prompt_template = ChatPromptTemplate.from_messages([
+  ('human',message)
+])
+###构建链
+chain = {"question":RunnablePassthrough(),"context":docs_find} | prompt_template | client
+resp = chain.invoke("请假")
+print(resp.content)
