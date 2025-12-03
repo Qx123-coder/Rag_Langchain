@@ -1,0 +1,137 @@
+import os
+from langchain_community.chat_models.tongyi import ChatTongyi
+from langchain_core.runnables import RunnableLambda
+from langchain.chains import create_retrieval_chain
+from langchain.schema.output_parser import StrOutputParser
+from langchain.schema.runnable import RunnablePassthrough
+import logging
+from datetime import datetime
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import Optional, List, Dict, Any
+from langchain.chains import create_sql_query_chain
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_rag.my_project2.init import init_chroma
+logging.basicConfig(
+    level = logging.INFO,
+    filename = f'backend_{datetime.now().strftime("%Y-%m-%d")}.log',
+    format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+#存在logging模块的manager中
+logger = logging.getLogger("rag_db")
+#初始化FastAPI应用
+app = FastAPI(
+    title = "智能知识助手后端",
+    description = "提供知识查询,SQL查询和系统状态检查的API服务",
+    version = "1.0"
+)
+class UserContext(BaseModel):
+    username:str
+    role:str
+class QueryRequest(BaseModel):
+    question:str
+    user_ctx:UserContext
+    chat_history:List[Dict[str,Any]] = []
+llm = ChatTongyi(
+    model = "qwen-plus",
+    temperature = 0.2,
+    max_retries = 3,
+    dashscope_api_key = os.getenv("DASHSCOPE_API_KEY")
+)
+vector_db = init_chroma()
+#设计上的逻辑缺陷导致的“保护机制”被过度触发的问题,一开始使用similarity_score并设定了阈值为0.7，对于用户所提到的比较宽泛的问题会无法找到。
+retriever = vector_db.as_retriever(
+    search_type = "similarity",
+    search_kwargs = {
+        'k': 5
+    }
+)
+def format_chat_history(chat_history):
+    '''格式化历史对话'''
+    if not chat_history:
+        return "无历史对话记录"
+    formatted = []
+    for msg in chat_history[-6:]:
+        role = msg['role']
+        formatted.append(f"{role}:{msg['content']}")
+    return "\n".join(formatted)
+def rewritten_query_with_history(question,chat_history):
+    '''根据历史对话和用户提问来重写问题'''
+    # 改进：如果历史对话为空或不足，直接返回原始问题
+    formatted_history = format_chat_history(chat_history)
+    if formatted_history == "无历史对话记录" or len(formatted_history) < 2:
+        logger.info(f"历史对话不足，直接使用原始问题:{question}")
+        return question  # 直接返回原始问题，跳过LLM重写
+    rewrite_prompt = ChatPromptTemplate.from_messages([
+        ("system","""
+        你是一个智能查询优化助手,请根据以下用户的问题以及对话历史来重新表述当前的问题,让它更加完整，便于我们后序的查询
+        对话历史:
+        {chat_history}
+        当前问题:
+        {question}
+        请严格遵照上下文和用户的问题,不要添加多余内容
+        """)
+    ])
+    rewritten_chain = rewrite_prompt | llm | StrOutputParser()
+    format_history = format_chat_history(chat_history)
+    rewritten_query = rewritten_chain.invoke({
+        'chat_history':format_history,
+        'question':question
+    })
+    logger.info(f"原始问题{question} -> 重写后问题:{rewritten_query}")
+    return rewritten_query.strip()
+@app.post("/query")
+async def query_knowledge(request:QueryRequest):
+    logger.info(f"收到知识查询:{request.question}")
+    if not request.chat_history:
+        request.chat_history = []
+    logger.info(f"上下文内容查询:{request.chat_history}")
+    try:
+        rewritten_query = rewritten_query_with_history(request.question,request.chat_history)
+        docs = retriever.invoke(rewritten_query)
+        context = '\n'.join(doc.page_content for doc in docs)
+        system_prompt = """
+        "角色":你是问答任务的助理,使用以下的上下文检索和历史对话来就回答用户的问题
+        历史对话:{chat_history}
+        检索到的上下文:{context}
+        当前的问题:{question}
+        请严格根据以上的信息回答问题,如果信息不足,请回复抱歉,用户请提供更多的信息,请不要取添加其他脱离语境的信息
+        """
+        prompt_template = ChatPromptTemplate.from_messages(
+            ('system',system_prompt)
+        )
+        formatted_history = format_chat_history(request.chat_history)
+        logger.info(f"上下文历史:{formatted_history}")
+        logger.info("开始执行链路")
+        rag_chain = (
+            {
+                "question":RunnablePassthrough(),
+                "context":RunnableLambda(lambda x:context),
+                "chat_history":RunnableLambda(lambda x:formatted_history)
+            }
+            | prompt_template | llm | StrOutputParser()
+        )
+        logger.info("结束执行链路")
+        result = rag_chain.invoke(request.question)
+        logger.info('--'*20)
+        logger.info(f"执行链路结果返回:{result}")
+        answer = result
+        source_data = []
+        for doc in docs:
+            source_data.append({
+                "content":doc.page_content,
+                "source":doc.metadata.get('source','未找到来源'),
+                "page":doc.metadata.get('page','未知页码'),
+                "similarity_score":doc.metadata.get('score',0.0)
+            })
+        return {
+            "answer":answer,
+            "source_data":source_data,
+            "rewritten_query": rewritten_query
+        }
+    except Exception as e:
+        logger.error(f"知识查询失败: {str(e)}")
+        raise HTTPException(status_code=500,detail= str(e))
+if __name__ == '__main__':
+    import uvicorn
+    uvicorn.run(app,host="127.0.0.1",port=8000)
